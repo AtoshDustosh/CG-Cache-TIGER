@@ -118,6 +118,8 @@ class Graph:
         batch_dirs = np.zeros([bs, n_neighbors], dtype=int)
 
         for i, (nid, t) in enumerate(zip(nids, ts)):
+            if nid == 0:
+                continue
             local_neighbors, local_eids, local_ts, local_dirs = self.find_before(nid, t)
 
             if len(local_neighbors) == 0:  # no neighbors, use default null values

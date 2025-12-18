@@ -24,6 +24,7 @@ from tiger.utils import BackgroundThreadGenerator
 
 from init_utils import init_data, init_model, init_parser
 from train_utils import EarlyStopMonitor, get_logger, hash_args, seed_all
+import logging
 
 from torch.profiler import (
     record_function,
@@ -70,6 +71,8 @@ def run(
     force,
     warmup_steps,
     cg_cache,
+    async_cache,
+    redo_NS,
 ):
     # Get hash
     args = {
@@ -106,6 +109,7 @@ def run(
     logger.info(f"[START {HASH}]")
     logger.info(f"Model version: {MODEL_VERSION}")
     logger.info(", ".join([f"{k}={v}" for k, v in args.items()]))
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
     if pathlib.Path(RESULT_SAVE_PATH).exists() and not force:
         logger.info("Duplicate task! Abort!")
@@ -130,6 +134,8 @@ def run(
             hist_len=hist_len,
             cg_cache=cg_cache,
             device=device,
+            async_cache=async_cache,
+            redo_NS=redo_NS,
         )
         (
             nfeats,
@@ -199,6 +205,7 @@ def run(
 
         early_stopper = EarlyStopMonitor(max_round=patience, epoch_start=epoch_start)
         for epoch in range(epoch_start, n_epochs):
+            path_tracings = debug.profile_dir / f"epoch{epoch}"
             prof_ctx = (
                 torch.profiler.profile(
                     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -206,7 +213,7 @@ def run(
                     record_shapes=True,
                     with_stack=True,
                     on_trace_ready=tensorboard_trace_handler(
-                        f"./tracings/epoch_{epoch}_train"
+                        str(path_tracings.absolute())
                     ),
                 )
                 if debug.ifprofile
@@ -277,7 +284,34 @@ def run(
                     m_contrast_loss.append(contrast_loss.item())
                     m_mutual_loss.append(mutual_loss.item())
                     m_loss.append(loss.item())
+
                     prof.step()
+
+            import matplotlib.pyplot as plt
+
+            # Example data
+            data = train_collator.cache_hits
+
+            # Create the plot
+            plt.figure(figsize=(12, 6))
+            x = np.arange(1, len(data) + 1)
+            plt.plot(
+                x,
+                data,
+                label="Values",
+                linestyle="-",
+                color="tomato",
+                linewidth=1,
+            )
+            plt.title("Cache hits")
+            plt.xlabel("Index")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+
+            # Save as image (PNG)
+            plt.savefig(path_tracings / "cache_hits.png", dpi=300, bbox_inches="tight")
 
             epoch_time = time.time() - start_epoch_t0
             epoch_times.append(epoch_time)
@@ -437,32 +471,6 @@ def run(
         logger.error(e)
         raise
 
-    import matplotlib.pyplot as plt
-
-    # Example data
-    data = train_collator.cache_hits
-
-    # Create the plot
-    plt.figure(figsize=(12, 6))
-    x = np.arange(1, len(data) + 1)
-    plt.plot(
-        x,
-        data,
-        label="Values",
-        linestyle="-",
-        color="tomato",
-        linewidth=1,
-    )
-    plt.title("Cache hits")
-    plt.xlabel("Index")
-    plt.ylabel("Value")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-
-    # Save as image (PNG)
-    plt.savefig("line_plot.png", dpi=300, bbox_inches="tight")
-
 
 def get_args():
     parser = init_parser()
@@ -506,6 +514,24 @@ def get_args():
         default=0.0,
         help="If not 0.0, use sample cache with the given number as cache ratio to accelerate cg sampling.",
     )
+    parser.add_argument(
+        "--profile_dir",
+        type=str,
+        default="./tracings",
+        help="The directory to store tracings.",
+    )
+    parser.add_argument(
+        "--async_cache",
+        action="store_true",
+        default=False,
+        help="Whether to use async cache",
+    )
+    parser.add_argument(
+        "--redo_NS",
+        action="store_true",
+        default=False,
+        help="Whether to redo negative sampling",
+    )
 
     args = parser.parse_args()
     debug.ifprofile = args.profile
@@ -514,7 +540,7 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
-    
+
     debug.setup(args)
 
     run(
@@ -552,6 +578,8 @@ if __name__ == "__main__":
         force=args.force,
         warmup_steps=args.warmup,
         cg_cache=args.cg_cache,
+        async_cache=args.async_cache,
+        redo_NS=args.redo_NS,
     )
-    
+
     debug.run.finish()

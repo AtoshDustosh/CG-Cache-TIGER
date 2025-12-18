@@ -128,6 +128,8 @@ def init_data(
     hist_len,
     cg_cache,
     device,
+    async_cache,
+    redo_NS,
 ):
     np.random.seed(seed)
 
@@ -156,6 +158,8 @@ def init_data(
         hist_len=hist_len,
         cg_cache=cg_cache,
         cache_device=device,
+        async_cache=async_cache,
+        redo_NS=redo_NS,
     )
     print(f"train graph total nodes: {train_graph.num_node}")
     eval_collator = GraphCollator(

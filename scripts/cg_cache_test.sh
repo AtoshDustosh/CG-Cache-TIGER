@@ -2,13 +2,9 @@
 
 export CUDA_VISIBLE_DEVICES=3
 
-cache_rate=0.0005
+cache_rate=0.05
 
-if (( $(echo "$cache_rate > 0" | bc -l) )); then
-    runtype="cached_${cache_rate}"
-else
-    runtype="uncached"
-fi
+runtype="cache_rate_${cache_rate}"
 
 profile_dir="tracings/test_${runtype}"
 rm -rf "${profile_dir}"
@@ -16,8 +12,8 @@ rm -rf "${profile_dir}"
 python cg_cache_test.py \
     --data wikipedia \
     --n_layers 2 \
-    --n_epochs 3 \
+    --n_epochs 1 \
     --profile \
     --profile_dir "${profile_dir}" \
     --cg_cache "${cache_rate}" \
-    --bs 3
+    --bs 200

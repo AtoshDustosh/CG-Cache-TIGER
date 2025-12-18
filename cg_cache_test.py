@@ -113,6 +113,8 @@ def run(
         hist_len=hist_len,
         cg_cache=cg_cache,
         device=device,
+        async_cache=False,
+        redo_NS=False,
     )
     (
         nfeats,
@@ -185,8 +187,8 @@ def run(
                 eids = eids.long().to(device)
 
                 # Generate batch dumps
-                if i_batch > 100:
-                    break
+                # if i_batch > 100:
+                #     break
 
                 from tiger.data.data_classes import ComputationGraph
 

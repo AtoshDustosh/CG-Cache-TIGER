@@ -83,12 +83,6 @@ def _setup_profiler(args):
     global ifprofile, profiler_ctx, profiler_schedule, profile_dir
     ifprofile = args.profile
 
-    # profiler_schedule = schedule(
-    #     wait=args.profile_wait,
-    #     warmup=args.profile_warmup,
-    #     active=args.profile_active,
-    #     repeat=args.profile_repeat,
-    # )
     profile_dir = Path(args.profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
