@@ -71,7 +71,7 @@ def _setup_wandb(args):
 profiler_schedule = schedule(
     wait=100,
     warmup=10,
-    active=1,
+    active=2,
     repeat=10,
     skip_first=20,
     skip_first_wait=1,

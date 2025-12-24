@@ -86,6 +86,8 @@ def run(
         device = torch.device("cpu")
     else:
         device = torch.device(f"cuda:{gpu}")
+    
+    print(f"Using device: {device}")
 
     restart_mode = restart_prob > 0
 

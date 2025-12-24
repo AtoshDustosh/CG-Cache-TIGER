@@ -94,6 +94,7 @@ class GraphCollator:
 
         # Background cache update thread
         self.async_cache = async_cache
+        self.redo_NS = redo_NS
         if async_cache:
             self.tqueue_main = Queue()
             self.tqueue_cache = Queue()
@@ -104,10 +105,7 @@ class GraphCollator:
                 daemon=True,
             )
             self.cg_thread.start()
-        self.redo_NS = redo_NS
 
-        # [obsolete] Old mechanism to synchronize
-        self.cache_stream = torch.cuda.Stream(device=cache_device)
         self.cache_hits = []
 
     def finish_epoch(self):
@@ -656,113 +654,6 @@ class GraphCollator:
         self.cache_hits.append(sum(unicounts[mask_uni2cached]) / (bs * 3))
 
         return layers, all_uni_nids
-
-    def collate_memory_nodes_with_cache(self, srcs, dsts, ndsts, tss, eids) -> Tuple:
-        """ """
-        base_nids = np.concatenate([srcs, dsts, ndsts])
-        base_tss = np.tile(tss, 3)
-        n_all = len(base_nids)
-
-        with self.cache_lock:
-            # Cache lookup
-            cached_layers, cached_mask, n_cached = self.cg_cache.old_get(base_nids)
-            # cached_nids = base_nids[cached_mask] # Already included in cached_layers
-            # cached_tss = base_tss[cached_mask] # Not needed because it's only used for temporal sampling
-            self.cache_hits.append(n_cached / len(base_nids))
-
-        # Sample the uncached
-        uncached_nids = base_nids[~cached_mask]
-        uncached_tss = base_tss[~cached_mask]
-
-        uncached_layers: List = [[] for _ in range(self.n_layers + 1)]
-        self._collate_memory_nodes_recursive(
-            uncached_nids,
-            np.full_like(uncached_tss, min(uncached_tss)),
-            self.n_layers,
-            uncached_layers,
-        )
-        uncached_layers[0] = [uncached_nids, np.array([]), np.array([])]
-
-        # Convert to tensors
-        for depth in range(len(uncached_layers)):
-            neigh_nids, neigh_eids, neigh_ts = uncached_layers[depth]
-            uncached_layers[depth] = [
-                torch.from_numpy(neigh_nids).long().to(self.cg_cache.device),
-                torch.from_numpy(neigh_eids).long().to(self.cg_cache.device),
-                torch.from_numpy(neigh_ts).float().to(self.cg_cache.device),
-            ]
-
-        def _cache_update():
-            with self.cache_lock:
-                torch.cuda.current_stream().wait_stream(self.cache_stream)
-
-                with torch.cuda.stream(self.cache_stream):
-                    # Cache replacement
-                    self.cg_cache.old_put(uncached_layers)
-
-                    # Update existing cached cgs with the current batch data
-                    self.cg_cache.old_update(srcs, dsts, tss, eids)
-
-        # threading.Thread(target=_cache_update, daemon=True).start()
-        _cache_update()
-
-        # Prepare the inverse index to map mixed results back to their original positions
-        index_all = torch.arange(n_all).to(self.cg_cache.device)
-        cached_mask_t = torch.from_numpy(cached_mask).to(self.cg_cache.device)
-        index_cached = cached_mask_t.nonzero(as_tuple=True)[0]
-        index_uncached = (~cached_mask_t).nonzero(as_tuple=True)[0]
-
-        index_mix = torch.concatenate([index_cached, index_uncached])
-        index_unmix = index_mix.scatter(0, index_mix, index_all)
-
-        # Concatenate cached and uncached layers
-        layers: List = []
-        if n_cached > 0:
-            # Prepare the 0th layer
-            layers.append(
-                [
-                    torch.concatenate(
-                        [cached_layers[0][0], uncached_layers[0][0]], dim=0
-                    ).gather(0, index_unmix),
-                    torch.tensor([]),
-                    torch.tensor([]),
-                ]
-            )
-            # Prepare 1st, ..., Lth layers
-            for l in range(1, self.n_layers + 1):
-                # Damn their wicked design
-                duplicates = self.n_neighbors ** (self.n_layers - l)  # k ** (L - 1)
-                unmix_base: torch.Tensor = index_unmix * duplicates
-                unmix_base = unmix_base.repeat_interleave(duplicates)
-                unmix_offsets = (
-                    torch.arange(duplicates).repeat(n_all).to(self.cg_cache.device)
-                )
-                index_unmix_layer = (
-                    (unmix_base + unmix_offsets)
-                    .unsqueeze(1)
-                    .repeat(1, self.n_neighbors)
-                )
-                # Reorder cached and uncached to their original positions
-                layers.append(
-                    [
-                        torch.concatenate(
-                            [cached_layers[l][0], uncached_layers[l][0]], dim=0
-                        ).gather(0, index_unmix_layer),
-                        torch.concatenate(
-                            [cached_layers[l][1], uncached_layers[l][1]], dim=0
-                        ).gather(0, index_unmix_layer),
-                        torch.concatenate(
-                            [cached_layers[l][2], uncached_layers[l][2]], dim=0
-                        ).gather(0, index_unmix_layer),
-                    ]
-                )
-        else:
-            layers = uncached_layers
-
-        all_nids = torch.cat([nids.flatten() for nids, _, _ in layers])
-        unique_ids = torch.unique(all_nids).cpu().numpy()
-
-        return layers, unique_ids
 
     def collate_history(self, nids: np.ndarray, ts: np.ndarray) -> SeqRestartData:
         # de-duplicate
