@@ -1,3 +1,4 @@
+from attr import dataclass
 import torch
 import numpy as np
 import random
@@ -94,3 +95,49 @@ def setup(args):
 
 
 cache_hits = []
+
+
+import socket
+import pickle
+import time
+import struct
+
+sender = socket.socket()
+sender.connect(("192.168.1.102", 60000))
+
+
+def send_obj_limited(sock, obj, bandwidth_MBps=1000, chunk_size=128 * 1024):
+    """
+    bandwidth_MBps: 限制带宽 (MB/s)
+    chunk_size: 每次发送的块大小
+    """
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    size = len(data)
+
+    sock.sendall(struct.pack("!Q", size))
+
+    bytes_per_sec = bandwidth_MBps * 1024 * 1024
+    sleep_time = chunk_size / bytes_per_sec
+
+    sent = 0
+    while sent < size:
+        end = min(sent + chunk_size, size)
+        sock.sendall(data[sent:end])
+        sent = end
+        time.sleep(sleep_time)
+
+
+ACK = b"\x01"
+
+
+def send_and_wait_ack(sock, obj):
+    t0 = time.time()
+
+    send_obj_limited(sock, obj)  # 你的 pickle + 带宽受限版本
+    ack = sock.recv(1)
+    if ack == b"":
+        raise RuntimeError("connection closed before ACK")
+    assert ack == ACK, ack
+
+    t1 = time.time()
+    return t1 - t0

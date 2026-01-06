@@ -15,6 +15,7 @@ class AsyncSignal(IntEnum):
     PARTITION_SENT = 1
     CACHED_SENT = 2
     MISSED_SENT = 3
+    START_UPDATE = 4
 
 
 class CGCache:
@@ -66,19 +67,8 @@ class CGCache:
         self.mapping = OrderedDict()  # map: nid -> cache slot
         self.free_slots = deque(range(self.cap))
 
-        # Some buffers to avoid redundant memory allocation
-        self.buf_offset = torch.zeros([self.cap], device=self.device, dtype=torch.long)
-        self.bufs_long = [torch.tensor([])]
-        self.bufs_float = [torch.tensor([])]
-        for l in range(1, self.L + 1):
-            self.bufs_long.append(
-                torch.zeros([self.cap, self.k**l], device=self.device, dtype=torch.long)
-            )
-            self.bufs_float.append(
-                torch.zeros(
-                    [self.cap, self.k**l], device=self.device, dtype=torch.float
-                )
-            )
+        # Temporary objects to reduce redundant operations
+        self.old_keys = list(self.mapping.keys())
 
         print(f"cg cache initialized with cap {self.cap}")
         pass
@@ -138,10 +128,12 @@ class CGCache:
         """
 
         # Scan srcs along with dsts. Get cached, uncached, replacables, and updatables.
-        uninids, index, index_uni2batch, unicounts = np.unique(
-            batch_nids, return_index=True, return_inverse=True, return_counts=True
+        uninids, index_uni2batch, unicounts = np.unique(
+            batch_nids,  return_inverse=True, return_counts=True
         )
         n_unique = len(uninids)
+
+        self.old_keys = list(self.mapping.keys())
 
         mask_uni2cached = np.isin(uninids, list(self.mapping.keys()))
         mask_uni2missed = ~mask_uni2cached
@@ -180,7 +172,11 @@ class CGCache:
 
         # Initialize the 0-th layer
         t_cached_nids = torch.from_numpy(unicached_nids).long().to(self.device)
-        cached_layers[0] = [t_cached_nids, [], []]
+        cached_layers[0] = [
+            t_cached_nids, # nid
+            torch.tensor([]), # eid 
+            torch.tensor([]), # tss
+        ]
 
         # Gather other L layers of CGs
         for l in range(1, self.L + 1):
@@ -202,8 +198,9 @@ class CGCache:
     @torch.no_grad()
     def exec_eviction(
         self,
-        bs: int,
-        batch_nids: np.ndarray,
+        srcs: np.ndarray,
+        dsts: np.ndarray,
+        ndsts: np.ndarray,
         unimissed: np.ndarray,
         ignore_ns: bool = True,
     ):
@@ -219,15 +216,7 @@ class CGCache:
             mask_unimissed_put: mask from unique missed to put.
             unimissed_put_nids: which unique missed nids' layers should be put in cache.
         """
-        srcs = batch_nids[:bs]
-        dsts = batch_nids[bs : 2 * bs]
-        ndsts = batch_nids[-bs:]
-
-        # Save old nodes' slots for later reordering
-        old_keys = np.array(list(self.mapping.keys()))
-        reorder_nids = np.zeros([self.cap], dtype=int)
-        for nid in old_keys:
-            reorder_nids[self.mapping[nid]] = nid
+        evicted_mapping = []
 
         if self.policy == "lru":
             for src, dst, ndst in zip(srcs, dsts, ndsts, strict=True):
@@ -236,53 +225,46 @@ class CGCache:
                     if nid in self.mapping:
                         self.mapping.move_to_end(nid)
                     else:
-                        new_slot = (
-                            self.free_slots.pop()
-                            if self.free_slots
-                            else self.mapping.popitem(last=False)[1]
-                        )
-                        self.mapping[nid] = new_slot
+                        if self.free_slots:
+                            slot_id = self.free_slots.pop()
+                        else:
+                            evicted_nid, slot_id = self.mapping.popitem(last=False)
+                            if evicted_nid in self.old_keys:
+                                evicted_mapping.append((evicted_nid, slot_id))
+                        self.mapping[nid] = slot_id
                     pass
                 pass
         else:
             raise NotImplementedError
 
-        new_keys = np.array(list(self.mapping.keys()))
-        mask_unimissed_put = np.isin(unimissed, new_keys)
-        unimissed_put_nids = unimissed[mask_unimissed_put]
+        reordered_nids = []
+        old_slot_ids = []
+        new_slot_ids = []
+        for nid, slot_id in evicted_mapping:
+            if nid in self.mapping:
+                reordered_nids.append(nid)
+                old_slot_ids.append(slot_id)
+                new_slot_ids.append(self.mapping[nid])
 
-        # Must use the to-be-put slots to avoid overwriting old data
-        default_slot = (
-            0 if len(unimissed_put_nids) == 0 else self.mapping[unimissed_put_nids[0]]
-        )
-        reorder_index = torch.tensor(
-            [self.mapping.get(nid, default_slot) for nid in reorder_nids],
-            device=self.device,
-        )
+        index_old = torch.tensor(old_slot_ids, dtype=torch.long, device=self.device)
+        index_new = torch.tensor(new_slot_ids, dtype=torch.long, device=self.device)
 
-        # Reorder slot data and offsets after cache eviction
-        """
-        The following code explains the basic logic:
-            self.offsets = self.offsets[reorder_index]
-            for l in range(1, self.L + 1):
-                self.slots_nids[l] = self.slots_nids[l][reorder_index]
-                self.slots_eids[l] = self.slots_eids[l][reorder_index]
-                self.slots_tss[l] = self.slots_tss[l][reorder_index]
-        We avoid repetitive memory allocation with persistent buffers.
-        """
-        self.buf_offset.copy_(self.offsets)
-        self.offsets.scatter_(0, reorder_index, self.buf_offset)
+        evicted_offsets = self.offsets.index_select(0, index_old)
+        self.offsets.index_copy_(0, index_new, evicted_offsets)
         for l in range(1, self.L + 1):
-            tmp_index = reorder_index.unsqueeze(-1).expand(-1, self.k**l)
-            self.bufs_long[l].copy_(self.slots_nids[l])
-            self.slots_nids[l].scatter_(0, tmp_index, self.bufs_long[l])
-            self.bufs_long[l].copy_(self.slots_eids[l])
-            self.slots_eids[l].scatter_(0, tmp_index, self.bufs_long[l])
-            self.bufs_float[l].copy_(self.slots_tss[l])
-            self.slots_tss[l].scatter_(0, tmp_index, self.bufs_float[l])
-            pass
+            evicted_nids = self.slots_nids[l].index_select(0, index_old)
+            evicted_eids = self.slots_eids[l].index_select(0, index_old)
+            evicted_tss = self.slots_tss[l].index_select(0, index_old)
+            self.slots_nids[l].index_copy_(0, index_new, evicted_nids)
+            self.slots_eids[l].index_copy_(0, index_new, evicted_eids)
+            self.slots_tss[l].index_copy_(0, index_new, evicted_tss)
 
-        return mask_unimissed_put, unimissed_put_nids
+        mask_unimissed_put = np.zeros_like(unimissed, dtype=np.bool_)
+        for i, nid in enumerate(unimissed):
+            if nid in self.mapping:
+                mask_unimissed_put[i] = True
+
+        return mask_unimissed_put, unimissed[mask_unimissed_put]
 
     @torch.no_grad()
     def put_missed(
